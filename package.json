@@ -1,8 +1,21 @@
 {
     "name": "@dsh-external/workflow",
     "version": "0.2.0",
-    "description": "KodaX-parity dynamic workflow harness for DeepSeek Harness",
+    "description": "Requirement-driven adaptation of the upstream @dsh-external/workflow (v0.1.2) for DSH 0.2.1-rc.3 — reusable, governed, durable multi-agent workflows with the full upstream feature surface",
     "type": "module",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/PatTianFang/dsh_workflow_fang.git"
+    },
+    "homepage": "https://github.com/PatTianFang/dsh_workflow_fang#readme",
+    "bugs": {
+        "url": "https://github.com/PatTianFang/dsh_workflow_fang/issues"
+    },
+    "upstream": {
+        "project": "omdsh-dev/dsh_workflow",
+        "version": "0.1.2",
+        "license": "MIT"
+    },
     "main": "lib/index.js",
     "types": "lib/index.d.ts",
     "exports": {
