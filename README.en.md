@@ -21,12 +21,19 @@ The native DSH `workflow` tool remains the best fit for a single foreground fan-
 
 ## Install
 
-Requires Node.js `>=22.19` and the DSH revision pinned in [`compatibility.json`](compatibility.json).
+Requires Node.js `>=22.19` and the DSH package generation pinned in [`compatibility.json`](compatibility.json) (currently DSH `0.2.1-rc.3`).
 
 ```sh
-dsh plugin --profile web add "github:dsh-external/dsh_workflow#main"
-dsh --profile web --dump-config
+# install from a local checkout of this repository
+dsh plugin --profile desktop add /path/to/dsh_workflow
+
+# or install from your GitHub fork once pushed
+dsh plugin --profile desktop add "github:<your-account>/dsh_workflow#main"
+
+dsh --profile desktop --dump-config
 ```
+
+In DeepSeek Harness Desktop the same bundle can be installed through the plugin manager by pointing it at this package directory.
 
 Restart the profile, then try:
 
@@ -62,25 +69,40 @@ See the [complete parity contract](docs/KODAX_PARITY.md) for the evidence-backed
 
 Generated scripts run in a separate QuickJS WebAssembly heap. The host exposes only a JSON capability bridge; imports, process/filesystem/shell/network access, timers, nondeterministic clock/randomness, and non-JSON boundary values are rejected. CPU slices, wall time, memory, and stack are bounded, and wall timeout closes the bridge and aborts the run.
 
-Read-only execution dynamically intersects the parent Agent's visible catalog with a trusted allow-list, so unknown or newly added mutation tools are excluded by default. Read evidence, successful mutation-tool plus Git-workspace change evidence, required changed paths, final-text checks, and bounded same-actor repair are built in. Deployments can add non-Git workspace evidence, worktrees, and target/effort dispatch through public adapter registrations; unsupported requests fail loudly.
+Read-only execution dynamically intersects the parent Agent's visible catalog with a trusted allow-list, so unknown or newly added mutation tools are excluded by default. DSH 0.2 dropped the per-delegation tool filter, so the mask is applied to the published child Agent's own scope before its first tool call; a provider that publishes no local Authority fails loudly instead of running unconstrained. Read evidence, successful mutation-tool plus Git-workspace change evidence, required changed paths, final-text checks, and bounded same-actor repair are built in. Deployments can add non-Git workspace evidence, worktrees, and target/effort dispatch through public adapter registrations; unsupported requests fail loudly.
 
 ## Development
 
-Keep the compatible DSH checkout at `../test-icetomoyo` or set `DSH_SNAPSHOT_DIR`.
+The plugin compiles against the published DSH capability packages pinned in `compatibility.json`; no DSH source checkout is required.
 
 ```sh
-pnpm install
-pnpm check
-pnpm test:coverage
-pnpm pack
+npm install
+npm run check          # compatibility pin + native projection contract + tests + typecheck + build
+npm run test:coverage  # requires the optional @vitest/coverage-v8 package
+npm pack
 ```
 
 The suite currently contains 179 tests and enforces 80% global statement, branch, function, and line coverage thresholds.
 
+## DSH 0.2 migration notes
+
+This release tracks DSH `0.2.1-rc.3`. The behavioral surface is unchanged; only the host seams were re-expressed:
+
+| Area | Before (DSH `0.0.1-rc.2`) | Now (DSH `0.2.1-rc.3`) |
+| --- | --- | --- |
+| Child start | `ctx.subagents.start(provider, request)` | `ctx.subagents.startActivation({ provider, label, request, signal, delivery: 'caller' })` |
+| Child agent handle | `SubagentRun.localAgent` | `parent.ctx.agents.get(childId)` on the published child |
+| Read-only child | `request.toolFilter` | `child.ctx.tools.restrict(mask)` at child scope |
+| Session history | `session.events` | `session.ownEvents()` |
+| Tool result evidence | `tool/result` content blocks | `tool/result` `message.toolCallId` / `message.isError` |
+| Plugin message source | `{ kind: 'plugin', plugin }` | registered `{ kind: 'dsh-workflow', form }` |
+| Background jobs | `owner: Agent`, `done.output` | `owner: agent.session.id`, `done.result` |
+| Native run-start event | `{ runId, name, turn: null }` | `{ runId, name }` |
+
 ## Known limitations
 
 - Trusted-local `.ts` uses Node 22's native erasable-syntax TypeScript support and Node's module cache (restart DSH after edits); publish transform-only syntax or hot-reloaded modules as `.mjs/.js`.
-- The current DSH one-shot subagent seam has no native existing-agent target, per-agent effort, or generic worktree option. Deployments register dispatch/isolation adapters; absent adapters fail loudly.
+- DSH `0.2.1-rc.3` no longer accepts a per-delegation tool filter or an existing-agent target. Read-only masks are applied to the published child scope, and target/effort dispatch or worktree isolation still require a deployment adapter; absent adapters fail loudly.
 - Built-in verification covers observed tool/read evidence, Git workspace mutation, per-required-path before/after fingerprints, and result postconditions; non-Git or external-authority policies register a verification adapter.
 - Only generated capsule runs carry immutable source snapshots that can be saved/rerun from history.
 - KodaX capsules are not treated as wire-compatible with `dsh.workflow` v1.

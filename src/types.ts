@@ -1,6 +1,24 @@
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SubagentRun, SubagentRuntime, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
+import type {} from '@deepseek-ai/dsh-llm'
+import type { SubagentActivation, SubagentRun, SubagentRuntime, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
 import type { ObjectJsonSchema, ToolRestriction } from '@deepseek-ai/dsh-tools'
+
+/**
+ * Plugin-owned durable message source.
+ *
+ * DSH retired the generic `{ kind: 'plugin' }` wrapper; a producer that needs a
+ * durable, attributable user-role message registers its own source kind through
+ * this merge-extensible map instead. `form` distinguishes the internal relay
+ * that steers a running child from the verification-repair prompt.
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-workflow': {
+      readonly kind: 'dsh-workflow'
+      readonly form?: string
+    }
+  }
+}
 
 export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue }
@@ -419,6 +437,15 @@ export interface WorktreeIsolationAdapter {
   prepare(input: { readonly runId: string; readonly taskId: string; readonly cwd: string; readonly parent: Agent }): Promise<{ readonly cwd: string; readonly parent: Agent; dispose(): Promise<void> }>
 }
 
+/**
+ * Child handle a deployment dispatch adapter may return.
+ *
+ * `startActivation` delivers an activation (childId) while an adapter that
+ * still owns a raw provider run delivers a `SubagentRun` (id); the engine
+ * normalizes both.
+ */
+export type WorkflowChildHandle = SubagentRun | SubagentActivation
+
 /** Deployment seam for KodaX target-agent dispatch and provider-specific effort controls. */
 export interface WorkflowDispatchAdapter {
   start(input: {
@@ -427,7 +454,7 @@ export interface WorkflowDispatchAdapter {
     readonly provider: string
     readonly request: SubagentStartRequest
     readonly subagents: SubagentRuntime
-  }): Promise<SubagentRun | WorkflowDispatchResult>
+  }): Promise<WorkflowChildHandle | WorkflowDispatchResult>
 }
 
 /** Optional deployment telemetry for target/effort transports that DSH cannot infer locally. */
@@ -446,7 +473,7 @@ export interface WorkflowDispatchTelemetry {
 }
 
 export interface WorkflowDispatchResult {
-  readonly run: SubagentRun
+  readonly run: WorkflowChildHandle
   readonly telemetry?: WorkflowDispatchTelemetry | Promise<WorkflowDispatchTelemetry>
 }
 

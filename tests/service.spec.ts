@@ -3,11 +3,23 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SubagentRuntime, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
+import { SessionId } from '@deepseek-ai/dsh-session'
+import type { SubagentActivationSpec, SubagentRuntime, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
 import { describe, expect, it, vi } from 'vitest'
 import { DynamicWorkflowService, projectPartitionKey } from '../src/service.js'
 import { validateWorkflowManifest } from '../src/capsule.js'
 import type { ResolvedWorkflowConfig, WorkflowRun, WorkflowRunSnapshot } from '../src/types.js'
+
+function toolSchemas(): Array<{ name: string }> {
+  return [{ name: 'read' }, { name: 'write' }, { name: 'shell' }]
+}
+
+function childAgent(): Agent {
+  return {
+    session: { ownEvents: () => [] },
+    ctx: { tools: { schemas: toolSchemas, restrict: vi.fn(() => vi.fn()) } },
+  } as unknown as Agent
+}
 
 function config(root: string): ResolvedWorkflowConfig {
   return {
@@ -22,7 +34,21 @@ function config(root: string): ResolvedWorkflowConfig {
 }
 
 function agent(cwd: string): Agent {
-  return { session: { id: 'parent', header: { cwd }, events: [], append: vi.fn() } } as unknown as Agent
+  const children = new Map<string, Agent>()
+  return {
+    session: { id: 'parent', header: { cwd }, ownEvents: () => [], append: vi.fn() },
+    ctx: {
+      tools: { schemas: toolSchemas },
+      agents: { get: (id: SessionId): Agent | undefined => children.get(String(id)) },
+    },
+    children,
+  } as unknown as Agent
+}
+
+/** Publish one fake activation child into its requesting parent's Agent registry. */
+function publish(parent: Agent, childId: string, child: Agent): void {
+  const registry = (parent as unknown as { children: Map<string, Agent> }).children
+  registry.set(childId, child)
 }
 
 function authoredPayload() {
@@ -35,20 +61,22 @@ function authoredPayload() {
 
 function subagents() {
   let sequence = 0
-  const start = vi.fn(async (_provider: string, request: SubagentStartRequest) => {
+  const start = vi.fn(async (spec: SubagentActivationSpec) => {
     const index = ++sequence
-    const isScout = request.label === 'workflow-scout'
-    const isAuthor = request.label === 'workflow-author'
+    const isScout = spec.label === 'workflow-scout'
+    const isAuthor = spec.label === 'workflow-author'
     const result = isScout
       ? { output: [{ type: 'text' as const, text: 'facts' }], stopReason: 'completed' as const }
       : isAuthor
         ? { output: [{ type: 'text' as const, text: 'capsule' }], structured: authoredPayload(), stopReason: 'completed' as const }
-        : { output: [{ type: 'text' as const, text: `child:${request.label ?? index}` }], stopReason: 'completed' as const }
-    return { id: `child-${index}`, localAgent: undefined, result: Promise.resolve(result), dispose: vi.fn(async () => {}) }
+        : { output: [{ type: 'text' as const, text: `child:${spec.label ?? index}` }], stopReason: 'completed' as const }
+    const childId = `child-${index}`
+    publish(spec.request.parent, childId, childAgent())
+    return { childId: SessionId(childId), result: Promise.resolve(result), dispose: vi.fn(async () => {}) }
   })
   return {
     start,
-    value: { getProvider: (name: string) => name === 'spawn' ? { name, capabilities: { outputSchema: true, depthLimit: true, toolFilter: true, persona: true }, inheritsParentContext: false } : undefined, start } as unknown as SubagentRuntime,
+    value: { getProvider: (name: string) => name === 'spawn' ? { name, capabilities: { outputSchema: true, depthLimit: true, agentOptions: true, agentPreset: true }, inheritsParentContext: false } : undefined, startActivation: start } as unknown as SubagentRuntime,
   }
 }
 
@@ -149,7 +177,10 @@ describe('dynamic workflow service', () => {
     const minimal = new DynamicWorkflowService(new Context(), { config: config(fx.root), subagents: fx.fake.value })
     const verification = { preflight: vi.fn(async () => []), verify: vi.fn(async () => []) }
     const isolation = { name: 'test', prepare: vi.fn(async () => ({ cwd: fx.root, parent: fx.agent, dispose: vi.fn(async () => {}) })) }
-    const dispatch = { start: vi.fn(async ({ provider, request, subagents: runtime }) => await runtime.start(provider, request)) }
+    const dispatch = { start: vi.fn(async ({ provider, request, subagents: runtime }: { provider: string; request: SubagentStartRequest; subagents: SubagentRuntime }) => {
+      const { label = 'workflow-agent', signal, ...rest } = request
+      return await runtime.startActivation({ provider, label, request: rest, signal, delivery: 'caller' })
+    }) }
     const removeVerification = minimal.registerVerificationAdapter(verification)
     expect(() => minimal.registerVerificationAdapter(verification)).toThrow(/already registered/u)
     removeVerification()

@@ -1,62 +1,39 @@
-import { existsSync } from 'node:fs'
-import { resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+/**
+ * Guard the native DSH workflow surface this plugin depends on.
+ *
+ * The plugin appends `tool-workflow/*` Session events so the stock DSH Web UI
+ * projects a background workflow run. The previous form of this check imported
+ * a DSH client source checkout; the 0.2 capability packages ship that
+ * vocabulary as the `@deepseek-ai/dsh-tool-workflow` module augmentation, so
+ * the contract is verified against the installed declarations instead.
+ */
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const snapshot = resolve(process.env.DSH_SNAPSHOT_DIR ?? '../test-icetomoyo')
-const runtimePath = resolve(snapshot, 'packages/client/runtime/lib/types/client/index.js')
-const workflowPath = resolve(snapshot, 'packages/client/ui-workflow-run/lib/types/client/workflow-definition.js')
-for (const path of [runtimePath, workflowPath]) {
-  if (!existsSync(path)) throw new Error(`DSH client build output is missing: ${path}`)
+const root = fileURLToPath(new URL('..', import.meta.url))
+const typesPath = join(root, 'node_modules', '@deepseek-ai', 'dsh-tool-workflow', 'lib', 'types', 'types.d.ts')
+
+let declaration
+try {
+  declaration = readFileSync(typesPath, 'utf8')
+} catch {
+  throw new Error(`@deepseek-ai/dsh-tool-workflow is not installed at ${typesPath}`)
 }
 
-const [{ ConversationNodeAssembler }, { workflowRunDefinition }] = await Promise.all([
-  import(pathToFileURL(runtimePath).href),
-  import(pathToFileURL(workflowPath).href),
-])
+const requiredEvents = ['tool-workflow/run-start', 'tool-workflow/agent-start', 'tool-workflow/agent-end', 'tool-workflow/run-end']
+const requiredFields = ['childId', 'stopReason', 'outcome', 'label']
 
-class EventDefinitions {
-  entries() { return [workflowRunDefinition] }
-  fallbackEntry() { return undefined }
+const problems = []
+for (const event of requiredEvents) {
+  if (!declaration.includes(`'${event}'`)) problems.push(`missing Session event '${event}'`)
+}
+for (const field of requiredFields) {
+  if (!new RegExp(`\\b${field}\\??:`, 'u').test(declaration)) problems.push(`missing data field '${field}'`)
 }
 
-const chatView = {
-  target: 'chat',
-  create: () => {
-    let nodes = new Map()
-    const snapshot = () => ({ nodes })
-    return {
-      empty: snapshot(),
-      replace: ({ nodes: values }) => { nodes = new Map(values.map(node => [node.key, node])); return snapshot() },
-      apply: ({ upserts }) => { nodes = new Map(nodes); for (const node of upserts) nodes.set(node.key, node); return snapshot() },
-    }
-  },
+if (problems.length > 0) {
+  throw new Error(`DSH native workflow projection contract changed:\n- ${problems.join('\n- ')}`)
 }
 
-class ViewDefinitions {
-  entries() { return [chatView] }
-}
-
-const input = (seq, type, data) => ({ event: { seq, time: seq * 100, type, data }, view: undefined })
-const assembler = new ConversationNodeAssembler(new EventDefinitions(), new ViewDefinitions())
-assembler.replaceWindow([
-  input(1, 'turn/start', { turn: 1 }),
-  input(2, 'step/start', { turn: 1, step: 1 }),
-  input(3, 'tool-workflow/run-start', { runId: 'background', name: 'background', turn: null }),
-  input(4, 'tool-workflow/agent-start', { runId: 'background', seq: 1, label: 'worker', childId: 'child-1' }),
-  input(5, 'step/end', { turn: 1, step: 1 }),
-  input(6, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
-], false)
-assembler.flush()
-
-const data = () => [...assembler.snapshot('chat').nodes.values()][0]?.data
-if (data()?.status !== 'running' || data()?.phases[0]?.members[0]?.status !== 'running') {
-  throw new Error(`DSH projected a session-scoped background workflow incorrectly: ${JSON.stringify(data())}`)
-}
-assembler.append(input(7, 'tool-workflow/agent-end', { runId: 'background', seq: 1, outcome: 'completed' }))
-assembler.append(input(8, 'tool-workflow/run-end', { runId: 'background', stopReason: 'completed' }))
-assembler.flush()
-if (data()?.status !== 'completed' || data()?.phases[0]?.members[0]?.status !== 'completed') {
-  throw new Error(`DSH ignored the workflow terminal facts: ${JSON.stringify(data())}`)
-}
-
-console.log('DSH session-scoped workflow projection verified')
+process.stdout.write('DSH native workflow projection contract verified\n')

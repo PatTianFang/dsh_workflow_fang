@@ -4,7 +4,7 @@ import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 import { randomUUID } from 'node:crypto'
 import { createWorkflowCapsule, validateWorkflowArgs, validateWorkflowCapsule } from './capsule.js'
-import { WorkflowControlError, resolveReadOnlyToolFilter, validateWorkflowTaskAdmission } from './engine.js'
+import { applyReadOnlyToolFilter, childAgentOf, resolveReadOnlyToolFilter, validateWorkflowTaskAdmission, WorkflowControlError } from './engine.js'
 import { assertRestrictedWorkflowQuality, lintRestrictedWorkflowSource, validateRestrictedWorkflowSource } from './source-policy.js'
 import { runRestrictedWorkflowScript } from './runtime.js'
 import { WORKFLOW_INTERNAL, type ModelTierRoute, type ResolvedWorkflowConfig, type WorkflowApi, type WorkflowCapsule, type WorkflowModule, type WorkflowSpawnAgentInput, type WorkflowTaskResult } from './types.js'
@@ -37,26 +37,40 @@ async function oneShot(
 ): Promise<{ readonly text: string; readonly structured?: unknown }> {
   const provider = subagents.getProvider(route.subagentProvider)
   if (provider === undefined) throw new Error(`workflow authoring provider "${route.subagentProvider}" is unavailable`)
-  if (!provider.capabilities.toolFilter) throw new Error(`workflow authoring provider "${route.subagentProvider}" cannot enforce read-only scouting`)
   if (outputSchema !== undefined && !provider.capabilities.outputSchema) throw new Error(`workflow authoring provider "${route.subagentProvider}" cannot produce structured output`)
-  const run = await subagents.start(route.subagentProvider, {
+  const activation = await subagents.startActivation({
+    provider: route.subagentProvider,
     label: outputSchema === undefined ? 'workflow-scout' : 'workflow-author',
-    prompt: [{ type: 'text', text: prompt }],
-    parent,
-    signal,
-    toolFilter: resolveReadOnlyToolFilter(parent, config.readOnlyAllowedTools, config.readOnlyToolFilter.deny),
-    agentOptions: {
-      ...(route.provider === undefined ? {} : { provider: route.provider }),
-      ...(route.model === undefined ? {} : { model: route.model }),
-      ...(route.maxTokens === undefined ? {} : { maxTokens: route.maxTokens }),
+    request: {
+      prompt: [{ type: 'text', text: prompt }],
+      parent,
+      agentOptions: {
+        ...(route.provider === undefined ? {} : { provider: route.provider }),
+        ...(route.model === undefined ? {} : { model: route.model }),
+        ...(route.maxTokens === undefined ? {} : { maxTokens: route.maxTokens }),
+      },
+      ...(outputSchema === undefined ? {} : { outputSchema }),
     },
-    ...(outputSchema === undefined ? {} : { outputSchema }),
+    signal,
+    delivery: 'caller',
   })
+  // Authoring children scout: they must stay on the deployment's read-only
+  // allow-list. DSH 0.2 has no delegation-time toolFilter, so the mask is
+  // applied to the published child scope before any tool call can run.
+  const child = childAgentOf(parent, String(activation.childId))
+  if (child === undefined) {
+    await activation.dispose()
+    throw new Error(`workflow authoring provider "${route.subagentProvider}" did not publish a local child agent; read-only scouting requires an in-process provider`)
+  }
+  const lift = applyReadOnlyToolFilter(child, resolveReadOnlyToolFilter(parent, config.readOnlyAllowedTools, config.readOnlyToolFilter.deny))
   try {
-    const result = await run.result
+    const result = await activation.result
     if (result.stopReason !== 'completed') throw new Error(`workflow authoring child ${result.stopReason}`)
     return { text: text(result.output), ...(result.structured === undefined ? {} : { structured: result.structured }) }
-  } finally { await run.dispose() }
+  } finally {
+    lift()
+    await activation.dispose()
+  }
 }
 
 function authorPrompt(request: string, scout: string, existing?: WorkflowCapsule, change?: string): string {

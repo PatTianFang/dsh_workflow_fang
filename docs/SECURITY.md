@@ -22,7 +22,7 @@ Capability-generated code is isolated from Node authority by QuickJS/WASM and ca
 
 ## DSH authority
 
-Child execution remains governed by the selected DSH provider. Read-only tasks require provider `toolFilter` support. Structured output requires provider `outputSchema` support. Missing capabilities reject before child launch. Normal DSH tool approvals and sandbox policies continue to apply inside children.
+Child execution remains governed by the selected DSH provider. Read-only tasks are enforced by restricting the published child Agent's own tool scope to the fail-closed allow-list; DSH 0.2 no longer accepts a per-delegation `toolFilter`, so a provider that publishes no local child Agent is rejected instead of running unconstrained. Structured output requires provider `outputSchema` support. Missing capabilities reject before child launch. Normal DSH tool approvals and sandbox policies continue to apply inside children.
 
 ## Filesystem safety
 

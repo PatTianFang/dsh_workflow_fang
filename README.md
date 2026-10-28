@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License MIT" src="https://img.shields.io/badge/License-MIT-blue.svg"></a>
-  <img alt="DSH 0.0.1-rc.2" src="https://img.shields.io/badge/DSH-0.0.1--rc.2-8257D0.svg">
+  <img alt="DSH 0.2.1-rc.3" src="https://img.shields.io/badge/DSH-0.2.1--rc.3-8257D0.svg">
   <img alt="Tests 179" src="https://img.shields.io/badge/tests-179%20passing-brightgreen.svg">
   <img alt="KodaX workflow parity" src="https://img.shields.io/badge/workflow-KodaX%20parity-0A84FF.svg">
 </p>
@@ -53,15 +53,21 @@ flowchart LR
 
 ## 快速开始
 
-要求：Node.js `>=22.19`，以及与 [`compatibility.json`](compatibility.json) 一致的 DSH 快照。
+要求：Node.js `>=22.19`，以及与 [`compatibility.json`](compatibility.json) 一致的 DSH 包代（当前为 DSH `0.2.1-rc.3`）。
 
 ```sh
-# 构建产物已提交，git 源安装不需要在用户侧编译
-dsh plugin --profile web add "github:dsh-external/dsh_workflow#main"
+# 构建产物已随仓库提交，git 源安装不需要在用户侧编译
+# 从本地仓库目录安装
+dsh plugin --profile desktop add /path/to/dsh_workflow
+
+# 或从你自己的 GitHub 仓库安装
+dsh plugin --profile desktop add "github:<你的账号>/dsh_workflow#main"
 
 # 验证 bundle 已进入 profile 合成树
-dsh --profile web --dump-config
+dsh --profile desktop --dump-config
 ```
+
+在 DeepSeek Harness Desktop 里，也可以用插件管理器直接指向本包目录完成安装。
 
 预期配置中出现：
 
@@ -76,7 +82,7 @@ dsh --profile web --dump-config
 /workflow list
 /workflow parallel-investigation {"question":"为什么这个测试会间歇失败？"}
 /workflow create 为这个仓库设计一个并行安全评审流程
-/workflow review --risk high --requirement "不得破坏公开 API" --test-evidence "pnpm test 通过" --wait
+/workflow review --risk high --requirement "不得破坏公开 API" --test-evidence "npm test 通过" --wait
 /workflow runs
 ```
 
@@ -199,31 +205,46 @@ workflow 启动和 `run_workflow` 默认立即返回 `{ runId, status, jobId? }`
 - 生成型脚本只能通过冻结的 WorkflowApi 发起 effect；脚本结果、参数和 RPC 值必须可 JSON 序列化。
 - 生成脚本运行在 QuickJS WebAssembly 独立堆中；宿主只暴露 JSON capability RPC。静态 policy 还会拒绝 import/require、process、文件、shell、网络、timer 与非确定性 API。
 - 同步执行、总墙钟、WASM 内存与栈都有上限；主函数返回或墙钟超时时会关闭 RPC、abort run，并等待所有已接收的宿主 RPC 与已发布 child 静默退出。可信本地模块仍具有宿主权限。
-- `readOnly: true` 使用“当前父 Agent 可见工具 ∩ 可信只读 allow-list”，未来新增写工具默认不可见；provider 不支持 `toolFilter` 时直接失败。
+- `readOnly: true` 使用“当前父 Agent 可见工具 ∩ 可信只读 allow-list”，未来新增写工具默认不可见。DSH 0.2 已取消每次派发的 `toolFilter`，因此该掩码改为在子 Agent 发布后立即施加到它自己的 scope（`child.ctx.tools.restrict`）；provider 未发布本地子 Agent 时直接失败，不会在无约束状态下运行。
 - token budget 在子 Agent 发布前预留，本地 Agent 有 usage 时按 Session 实际值核算。
 - read-path、成功 mutation tool + Git workspace 指纹变化、每个 required changed path 的前后内容指纹、final-text 与 bounded same-actor repair 已内建；部署可以用带稳定 `cacheIdentity` 的 `registerVerificationAdapter()` 叠加非 Git 或更强的 workspace 证据。worktree 通过 `registerIsolationAdapter()` 接入，未注册时明确失败。
 - catalog 保存/替换/改名/删除使用规范化根目录、逐段 junction/symlink 拒绝与原子独占发布；并发同名保存不会互相覆盖。
-- DSH one-shot seam 没有原生 existing-agent target / effort 控制；部署可在首次运行前注册 `registerDispatchAdapter()` 完整承接这两个字段，否则 fail loud。
+- DSH 通用 subagent seam 没有原生 existing-agent target / effort 控制；部署可在首次运行前注册 `registerDispatchAdapter()` 完整承接这两个字段，否则 fail loud。
 
 更多细节见 [安全模型](docs/SECURITY.md)和[架构说明](docs/ARCHITECTURE.md)。
 
 ## 开发与验证
 
-仓库旁需有兼容 DSH checkout，默认路径为 `../test-icetomoyo`，也可设置 `DSH_SNAPSHOT_DIR`。
+插件直接编译自 npm 上发布的 DSH 能力包，版本由 [`compatibility.json`](compatibility.json) 固定，不再需要旁挂 DSH 源码 checkout。
 
 ```sh
-pnpm install
-pnpm check           # 快照 pin + 真实 DSH 投影 + 179 tests + typecheck + build
-pnpm test:coverage   # 语句/分支/函数/行全局阈值均为 80%
-pnpm pack
+npm install
+npm run check           # 兼容 pin + 原生投影契约 + tests + typecheck + build
+npm run test:coverage   # 需要额外安装可选的 @vitest/coverage-v8
+npm pack
 ```
 
-兼容基线、commit 和验证时间记录在 [`compatibility.json`](compatibility.json)。发布前必须重新 fetch DSH 默认分支并更新此文件。
+兼容基线、各包版本和验证时间记录在 [`compatibility.json`](compatibility.json)。升级 DSH 后先更新此文件，再跑 `npm run check`。
+
+## 从 DSH 0.0.1-rc.2 迁移到 0.2.1-rc.3
+
+本版本的行为面不变，只重新表达宿主接缝：
+
+| 领域 | 旧（DSH `0.0.1-rc.2`） | 新（DSH `0.2.1-rc.3`） |
+| --- | --- | --- |
+| 子 Agent 启动 | `ctx.subagents.start(provider, request)` | `ctx.subagents.startActivation({ provider, label, request, signal, delivery: 'caller' })` |
+| 子 Agent 句柄 | `SubagentRun.localAgent` | 通过 `parent.ctx.agents.get(childId)` 取得已发布子 Agent |
+| 只读子 Agent | `request.toolFilter` | 在子 Agent 自己的 scope 上 `child.ctx.tools.restrict(mask)` |
+| Session 历史 | `session.events` | `session.ownEvents()` |
+| 工具证据 | `tool/result` 内容块 | `tool/result` 的 `message.toolCallId` / `message.isError` |
+| 插件消息 source | `{ kind: 'plugin', plugin }` | 自注册 `{ kind: 'dsh-workflow', form }` |
+| 后台 job | `owner: Agent`、`done.output` | `owner: agent.session.id`、`done.result` |
+| 原生 run-start 事件 | `{ runId, name, turn: null }` | `{ runId, name }` |
 
 ## 已知限制
 
 - trusted-local `.ts` 使用 Node 22 原生 erasable-syntax TypeScript，并遵循 Node module cache（修改后重启 DSH）；需要 enum 等 transform-only 语法或热重载时请发布为 `.mjs/.js`。
-- 当前 DSH 通用 subagent seam 不直接支持 existing-agent target、per-agent effort 和 worktree；相应请求需要部署注册 dispatch/isolation adapter，未注册时 fail loud。
+- DSH `0.2.1-rc.3` 已取消每次派发的 tool filter 与 existing-agent target：只读掩码改为作用于已发布子 Agent 的 scope，target/effort 与 worktree 仍需部署注册 dispatch/isolation adapter，未注册时 fail loud。
 - 内建 verification 能证明实际 read/mutation tool evidence、Git workspace 变化、每个 required path 的任务前后指纹与文本后置条件；非 Git 工作区或需要外部权威证据的策略由 verification adapter 补充。
 - 仅生成型 capsule run 能保存不可变 script snapshot；纯函数 trusted-package/local run 不能从 run id 再保存。
 - capsule v1 与 KodaX capsule 不做 wire compatibility；外部 capsule 不会被误执行。
@@ -231,7 +252,7 @@ pnpm pack
 
 ## 致谢
 
-- [DeepSeek Harness](https://github.com/dsh2026/test-icetomoyo) 提供 Harness、插件和子 Agent 能力面。
+- [DeepSeek Harness](https://www.npmjs.com/org/deepseek-ai) 提供 Harness、插件和子 Agent 能力面（`@deepseek-ai/dsh-*`）。
 - [KodaX](https://github.com/icetomoyo/KodaX) 提供 workflow 产品设计的行为参考；本插件为独立实现。
 - `dsh-external` 社区插件为 bundle 安装、验证、安全边界和文档结构提供了实践参考。
 

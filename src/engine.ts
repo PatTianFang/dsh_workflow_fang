@@ -5,9 +5,9 @@ import { isAbsolute, relative, resolve, sep } from 'node:path'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { Session, SessionEventMap } from '@deepseek-ai/dsh-session'
-import type { SubagentRun, SubagentRuntime, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
+import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
+import { SessionId, type Session, type SessionEventMap } from '@deepseek-ai/dsh-session'
+import type { SubagentActivation, SubagentResult, SubagentRun, SubagentRuntime, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
 import { WorkflowRunId } from '@deepseek-ai/dsh-workflow'
 import type { ToolWorkflowRunStartData } from '@deepseek-ai/dsh-tool-workflow/types'
 import { assertObjectJsonSchema, validateJsonSchemaValue, type ObjectJsonSchema, type ToolRestriction } from '@deepseek-ai/dsh-tools'
@@ -34,7 +34,7 @@ interface TrackedTask {
   readonly startedAt: number
   status: WorkflowTaskSnapshot['status']
   childId?: string
-  run?: SubagentRun
+  run?: WorkflowChildRun
   result?: WorkflowTaskResult
   promise: Promise<WorkflowTaskResult>
   resolve: (value: WorkflowTaskResult) => void
@@ -47,10 +47,62 @@ interface TrackedTask {
   preflightWarnings?: readonly string[]
   origin?: 'executed' | 'replayed-from-cache'
   phase?: string
+  /** Pending lift of a read-only restriction applied to the child agent scope. */
+  liftReadOnly?: () => void
 }
 
-function isDispatchEnvelope(value: SubagentRun | { readonly run: SubagentRun; readonly telemetry?: WorkflowDispatchTelemetry | Promise<WorkflowDispatchTelemetry> }): value is { readonly run: SubagentRun; readonly telemetry?: WorkflowDispatchTelemetry | Promise<WorkflowDispatchTelemetry> } {
-  return 'run' in value
+/**
+ * Provider-neutral child handle. DSH `startActivation` delivers an activation
+ * (childId) while a deployment dispatch adapter may still hand back a
+ * `SubagentRun`; the workflow engine only needs identity, terminal result, and
+ * disposal.
+ */
+export interface WorkflowChildRun {
+  readonly childId: string
+  readonly result: Promise<SubagentResult>
+  dispose(): Promise<void>
+}
+
+function childRunOf(run: SubagentRun): WorkflowChildRun {
+  return { childId: String(run.id), result: run.result, dispose: async () => { await run.dispose() } }
+}
+
+/**
+ * Resolve the live child Agent DSH published for one activation. Evidence,
+ * usage accounting, steering, cancellation, and read-only restrictions all
+ * need the child's own scoped Agent rather than the run handle.
+ * @param parent - the delegating parent whose scope holds the Agent registry.
+ * @param childId - durable child session id, when the run is local.
+ * @returns the live child Agent, or undefined for an absent/external child.
+ */
+export function childAgentOf(parent: Agent, childId: string | undefined): Agent | undefined {
+  if (childId === undefined) return undefined
+  try {
+    const agents = (parent.ctx as { readonly agents?: { get(id: SessionId): Agent | undefined } } | undefined)?.agents
+    return agents?.get(SessionId(childId))
+  } catch {
+    return undefined
+  }
+}
+
+/** What a deployment dispatch adapter or the managed activation seam returns. */
+type WorkflowDispatchOutcome =
+  | WorkflowChildRun
+  | SubagentRun
+  | { readonly run: SubagentRun | SubagentActivation; readonly telemetry?: WorkflowDispatchTelemetry | Promise<WorkflowDispatchTelemetry> }
+
+function isDispatchEnvelope(value: WorkflowDispatchOutcome): value is { readonly run: SubagentRun | SubagentActivation; readonly telemetry?: WorkflowDispatchTelemetry | Promise<WorkflowDispatchTelemetry> } {
+  return 'run' in value && !('result' in value)
+}
+
+function asChildRun(value: WorkflowDispatchOutcome): WorkflowChildRun {
+  if (isDispatchEnvelope(value)) return asChildRun(value.run)
+  if ('childId' in value && value.childId !== undefined) {
+    const activation = value
+    return { childId: String(activation.childId), result: activation.result, dispose: async () => { await activation.dispose() } }
+  }
+  if ('id' in value) return childRunOf(value)
+  return value
 }
 
 interface MutableRun {
@@ -90,6 +142,16 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/**
+ * Build one plugin-authored user-role message for a child agent.
+ * @param content - model-facing text delivered as steer, follow-up, or repair.
+ * @param form - producer form recorded on the durable message source.
+ * @returns the identified user message.
+ */
+function workflowRelayMessage(content: string, form: 'relay' | 'verification-repair' = 'relay'): UserMessage {
+  return createUserMessage({ content: [{ type: 'text', text: content }], source: { kind: 'dsh-workflow', form } })
+}
+
 export class WorkflowControlError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options)
@@ -117,7 +179,7 @@ function usageOf(agent: Agent | undefined): WorkflowTaskUsage | undefined {
   let outputTokens = 0
   let cacheReadTokens = 0
   let observed = false
-  for (const event of agent.session.events) {
+  for (const event of agent.session.ownEvents()) {
     if (event.type !== 'assistant/message' || event.data.usage === undefined) continue
     observed = true
     inputTokens += event.data.usage.inputTokens
@@ -199,14 +261,16 @@ function stringLeaves(value: unknown): string[] {
 function observedToolEvidence(agent: Agent | undefined): { readonly readPaths: readonly string[]; readonly mutationToolCalls: readonly string[] } {
   if (agent === undefined) return { readPaths: [], mutationToolCalls: [] }
   const successful = new Set<string>()
-  for (const event of agent.session.events) {
+  for (const event of agent.session.ownEvents()) {
     if (event.type !== 'tool/result' || event.data.error !== undefined) continue
-    for (const block of event.data.message.content) if (block.type === 'tool-result' && block.isError !== true) successful.add(String(block.toolCallId))
+    // DSH 0.2 carries the tool result as the identified ToolResultMessage; the
+    // older content-block projection no longer exists on this event.
+    if (event.data.message.isError !== true) successful.add(String(event.data.message.toolCallId))
   }
   const readPaths: string[] = []
   const mutationToolCalls: string[] = []
   const mutationNames = new Set(['write', 'edit', 'str_replace_editor', 'bash', 'pwsh', 'terminal_create', 'terminal_write', 'cordis_mount', 'cordis_unmount'])
-  for (const event of agent.session.events) {
+  for (const event of agent.session.ownEvents()) {
     if (event.type !== 'tool/call' || !successful.has(String(event.data.callId))) continue
     if (mutationNames.has(event.data.name)) mutationToolCalls.push(event.data.name)
     if (!['read', 'read_image', 'grep', 'glob'].includes(event.data.name)) continue
@@ -225,7 +289,7 @@ function pathObserved(required: string, observed: readonly string[], cwd: string
 
 function latestAssistantText(agent: Agent | undefined, fallback: string): string {
   if (agent === undefined) return fallback
-  for (const event of [...agent.session.events].reverse()) {
+  for (const event of [...agent.session.ownEvents()].reverse()) {
     if (event.type !== 'assistant/message') continue
     const text = event.data.message?.content?.filter(block => block.type === 'text').map(block => block.text).join('\n') ?? ''
     if (text.length > 0) return text
@@ -235,7 +299,7 @@ function latestAssistantText(agent: Agent | undefined, fallback: string): string
 
 function childRecordedCompleted(agent: Agent | undefined): boolean {
   if (agent === undefined) return false
-  const end = [...agent.session.events].reverse().find(event => event.type === 'turn/end')
+  const end = [...agent.session.ownEvents()].reverse().find(event => event.type === 'turn/end')
   return end?.type === 'turn/end' && end.data.reason.kind === 'completed'
 }
 
@@ -300,28 +364,64 @@ async function gitWorkspaceState(cwd: string, requiredPaths: readonly string[] =
   } catch { return undefined }
 }
 
-interface SessionScopedWorkflowRunStartData extends ToolWorkflowRunStartData {
-  /** Generic DSH Conversation coordinate: null explicitly owns this event at Session scope. */
-  readonly turn: null
-}
-
 function appendNative<T extends keyof SessionEventMap>(session: Session, type: T, data: SessionEventMap[T]): void {
   const append = session.append.bind(session) as (event: T, value: SessionEventMap[T]) => void
   append(type, data)
 }
 
-function appendSessionScopedRunStart(session: Session, data: SessionScopedWorkflowRunStartData): void {
-  const append = session.append.bind(session) as (event: 'tool-workflow/run-start', value: SessionScopedWorkflowRunStartData) => void
+/**
+ * Append the run-start marker of a dynamic workflow.
+ *
+ * DSH 0.2 owns the run's conversation scope in the projection itself, so the
+ * payload is the plain {@link ToolWorkflowRunStartData} and no longer carries a
+ * caller-declared `turn` coordinate.
+ * @param session - the parent session that owns the workflow run.
+ * @param data - run identity and workflow name.
+ */
+function appendSessionScopedRunStart(session: Session, data: ToolWorkflowRunStartData): void {
+  const append = session.append.bind(session) as (event: 'tool-workflow/run-start', value: ToolWorkflowRunStartData) => void
   append('tool-workflow/run-start', data)
 }
 
 const DEFAULT_READ_ONLY_TOOLS = ['read', 'read_image', 'glob', 'grep', 'lsp', 'skill', 'web_search'] as const
 
+/** Global tool names one agent scope can currently see. */
+export function visibleToolNames(agent: Agent): string[] {
+  const schemas = agent.ctx?.tools?.schemas(agent) ?? []
+  return schemas.map(schema => schema.name).filter(name => name !== 'run_code')
+}
+
 export function resolveReadOnlyToolFilter(parent: Agent, configured: readonly string[] = DEFAULT_READ_ONLY_TOOLS, denied: readonly string[] = []): ToolRestriction {
-  const schemas = parent.ctx?.tools?.schemas(parent) ?? []
-  const visible = new Set(schemas.map(schema => schema.name).filter(name => name !== 'run_code'))
+  const visible = new Set(visibleToolNames(parent))
   const deny = new Set(denied)
   return { allow: [...new Set(configured)].filter(name => visible.has(name) && !deny.has(name)) }
+}
+
+/**
+ * Apply a read-only tool mask to one published child Agent.
+ *
+ * DSH 0.2 removed the per-delegation `toolFilter` from `SubagentStartRequest`
+ * and tells deployments to configure tools in an Agent Preset selected with
+ * `agentPreset`. The tool registry still owns per-scope restrictions, so the
+ * workflow engine applies the same mask the delegation seam used to apply, on
+ * the child's own scope. A restriction filters what a scope inherits and never
+ * what its own layer registers, so the child keeps the structured-output
+ * machinery it answers through.
+ *
+ * An empty allow list means "no tool may run"; the registry rejects empty
+ * filters, so that shape is expressed as a deny of every inherited name.
+ * @param child - the live child Agent whose scope receives the mask.
+ * @param filter - the resolved read-only mask.
+ * @returns the exact disposer that lifts the restriction.
+ */
+export function applyReadOnlyToolFilter(child: Agent, filter: ToolRestriction): () => void {
+  if (filter.allow !== undefined && filter.allow.length === 0) {
+    const deny = visibleToolNames(child)
+    if (deny.length === 0) return () => {}
+    return child.ctx.tools.restrict({ deny })
+  }
+  if (filter.allow === undefined && (filter.deny === undefined || filter.deny.length === 0)) return () => {}
+  return child.ctx.tools.restrict(filter)
 }
 
 export class WorkflowSemaphore {
@@ -480,7 +580,10 @@ export function validateWorkflowTaskAdmission(input: WorkflowSpawnAgentInput, co
   const subagentProvider = input.subagentType ?? route.subagentProvider ?? context.config.defaultProvider
   const descriptor = context.subagents?.getProvider(subagentProvider)
   if (context.subagents !== undefined && descriptor === undefined) throw new WorkflowControlError(`subagent provider "${subagentProvider}" is unavailable`)
-  if (readOnly && descriptor !== undefined && !descriptor.capabilities.toolFilter) throw new WorkflowControlError(`subagent provider "${subagentProvider}" cannot enforce read-only tool filtering`)
+  // DSH 0.2 no longer accepts a per-delegation tool filter, so read-only is
+  // enforced on the published child's own scope (see applyReadOnlyToolFilter).
+  // A provider that publishes no local Agent cannot be constrained that way;
+  // driveTask fails loud at that point instead of silently running unconstrained.
   if (input.outputSchema !== undefined && descriptor !== undefined && !descriptor.capabilities.outputSchema) throw new WorkflowControlError(`subagent provider "${subagentProvider}" cannot produce structured output`)
   return { readOnly, route, allocation, subagentProvider }
 }
@@ -628,7 +731,7 @@ export class DynamicWorkflowEngine {
     run.pauseWaiters.clear()
     for (const task of run.tasks.values()) {
       if (task.status === 'running') {
-        task.run?.localAgent?.cancel({ kind: 'parent' })
+        childAgentOf(run.input.parent, task.childId)?.cancel({ kind: 'parent' })
         void task.run?.dispose()
       }
     }
@@ -639,7 +742,7 @@ export class DynamicWorkflowEngine {
     const infoId = WorkflowRunId(run.snapshot.runId)
     // Dynamic workflows outlive the tool step that launches them. Session-scope
     // the start so DSH does not infer an interruption when that step closes.
-    appendSessionScopedRunStart(run.nativeSession, { runId: infoId, name: run.snapshot.workflow, turn: null })
+    appendSessionScopedRunStart(run.nativeSession, { runId: infoId, name: run.snapshot.workflow })
     this.emit(run, 'workflow-started', { runId: run.snapshot.runId, workflow: run.snapshot.workflow })
     try {
       if (this.needsApproval(run.input)) {
@@ -915,14 +1018,15 @@ export class DynamicWorkflowEngine {
       output: async taskId => this.taskSnapshot(run, taskId),
       send: async (taskId, content) => {
         const task = this.expectTask(run, taskId)
-        if (task.status !== 'running' || task.run?.localAgent === undefined) throw new Error(`task "${taskId}" does not support live messaging on its selected provider`)
-        task.run.localAgent.steer(createUserMessage({ content: [{ type: 'text', text: content }], source: { kind: 'plugin', plugin: '@dsh-external/workflow', form: 'relay' } }))
+        const child = task.status === 'running' ? childAgentOf(run.input.parent, task.childId) : undefined
+        if (child === undefined) throw new Error(`task "${taskId}" does not support live messaging on its selected provider`)
+        child.steer(workflowRelayMessage(content))
         this.emit(run, 'agent-message', { taskId, content })
       },
       stop: async (taskId, reason) => {
         const task = this.expectTask(run, taskId)
         if (task.status !== 'running') return
-        task.run?.localAgent?.cancel({ kind: 'parent' })
+        childAgentOf(run.input.parent, task.childId)?.cancel({ kind: 'parent' })
         await task.run?.dispose()
         this.emit(run, 'workflow-log', { message: `stop requested for ${taskId}`, data: { reason } })
       },
@@ -1110,43 +1214,45 @@ export class DynamicWorkflowEngine {
       const prompt = this.taskPrompt(task.input, isolation?.cwd)
       const modelProvider = task.input.provider ?? route.provider
       const model = task.input.model ?? route.model
-      const request: SubagentStartRequest = {
+      const request: Omit<SubagentStartRequest, 'signal'> = {
         label: task.input.name,
         prompt: [{ type: 'text', text: prompt }],
         parent,
-        signal: run.controller.signal,
         agentOptions: {
           ...(modelProvider === undefined ? {} : { provider: modelProvider }),
           ...(model === undefined ? {} : { model }),
           ...(allocation <= 0 ? {} : { maxTokens: allocation }),
         },
-        ...(readOnly ? { toolFilter: resolveReadOnlyToolFilter(parent, this.deps.config.readOnlyAllowedTools, this.deps.config.readOnlyToolFilter.deny) } : {}),
         ...(task.input.outputSchema === undefined ? {} : { outputSchema: task.input.outputSchema }),
       }
       const dispatched = task.input.target !== undefined || task.input.effort !== undefined
         ? await this.deps.dispatch!.start({
           ...(task.input.target === undefined ? {} : { target: task.input.target }),
           ...(task.input.effort === undefined ? {} : { effort: task.input.effort }),
-          provider: subagentProvider, request, subagents: this.deps.subagents,
+          provider: subagentProvider, request: { ...request, signal: run.controller.signal }, subagents: this.deps.subagents,
         })
-        : await this.deps.subagents.start(subagentProvider, request)
-      const childRun = isDispatchEnvelope(dispatched) ? dispatched.run : dispatched
+        : await this.startChild(subagentProvider, request, run.controller.signal)
+      const childRun = asChildRun(dispatched)
       const dispatchTelemetry = isDispatchEnvelope(dispatched) ? dispatched.telemetry : undefined
       task.run = childRun
-      task.childId = childRun.id
+      task.childId = childRun.childId
+      // Read-only has no delegation-time seam in DSH 0.2: constrain the
+      // published child scope before its first tool call is possible.
+      if (readOnly) task.liftReadOnly = this.restrictChildToReadOnly(parent, childRun.childId, subagentProvider)
       const taskPhase = task.input.phase ?? phase
-      this.emit(run, 'agent-started', { taskId: task.id, name: task.input.name, ...(taskPhase === undefined ? {} : { phase: taskPhase }), childId: childRun.id, provider: subagentProvider })
+      this.emit(run, 'agent-started', { taskId: task.id, name: task.input.name, ...(taskPhase === undefined ? {} : { phase: taskPhase }), childId: childRun.childId, provider: subagentProvider })
       appendNative(run.nativeSession, 'tool-workflow/agent-start', {
         runId: WorkflowRunId(run.snapshot.runId), seq: task.sequence, label: task.input.name,
-        ...(taskPhase === undefined ? {} : { phase: taskPhase }), childId: childRun.id,
+        ...(taskPhase === undefined ? {} : { phase: taskPhase }), childId: SessionId(childRun.childId),
       })
       task.nativeStarted = true
       task.resolveReady()
+      const childAgent = childAgentOf(parent, childRun.childId)
       const outcome = await childRun.result
       const endedAt = this.now()
       let telemetry: WorkflowDispatchTelemetry | undefined
       try { telemetry = await dispatchTelemetry } catch { /* optional telemetry cannot fail completed work */ }
-      let measuredUsage = usageOf(childRun.localAgent) ?? telemetry?.usage
+      let measuredUsage = usageOf(childAgent) ?? telemetry?.usage
       let usage = measuredUsage?.totalTokens ?? 0
       if (total !== undefined) { run.reservedTokens -= allocation; reservationActive = false; run.spentTokens += usage }
       else run.spentTokens += usage
@@ -1159,7 +1265,7 @@ export class DynamicWorkflowEngine {
       if (status !== 'stopped' && task.input.outputSchema !== undefined) {
         const rc2MissingCapture = outcome.stopReason === 'error'
           && outcome.structured === undefined
-          && childRecordedCompleted(childRun.localAgent)
+          && childRecordedCompleted(childAgent)
         const first = structuredEvaluation(structured, finalText, task.input.outputSchema)
         structured = first.errors.length === 0 ? first.value : undefined
         let repairErrors = first.errors
@@ -1170,9 +1276,10 @@ export class DynamicWorkflowEngine {
           run.controller.signal.addEventListener('abort', forwardAbort, { once: true })
           const timer = setTimeout(() => repairController.abort('structured output repair timed out'), 15_000)
           timer.unref()
-          let repairRun: SubagentRun | undefined
+          let repairRun: WorkflowChildRun | undefined
+          let liftRepairReadOnly: (() => void) | undefined
           try {
-            const repairRequest: SubagentStartRequest = {
+            const repairRequest: Omit<SubagentStartRequest, 'signal'> = {
               label: `${task.input.name} structured repair`,
               prompt: [{ type: 'text', text: [
                 'Re-format the completed report as the JSON object required by the workflow.',
@@ -1182,28 +1289,34 @@ export class DynamicWorkflowEngine {
                 `Completed report:\n${finalText}`,
               ].join('\n\n') }],
               parent,
-              signal: repairController.signal,
               ...(request.agentOptions === undefined ? {} : { agentOptions: request.agentOptions }),
-              toolFilter: { allow: [] },
               outputSchema: task.input.outputSchema,
             }
             const repairDispatch = task.input.target !== undefined || task.input.effort !== undefined
               ? await this.deps.dispatch!.start({
                 ...(task.input.target === undefined ? {} : { target: task.input.target }),
                 ...(task.input.effort === undefined ? {} : { effort: task.input.effort }),
-                provider: subagentProvider, request: repairRequest, subagents: this.deps.subagents,
+                provider: subagentProvider, request: { ...repairRequest, signal: repairController.signal }, subagents: this.deps.subagents,
               })
-              : await this.deps.subagents.start(subagentProvider, repairRequest)
-            repairRun = isDispatchEnvelope(repairDispatch) ? repairDispatch.run : repairDispatch
+              : await this.startChild(subagentProvider, repairRequest, repairController.signal)
+            const repairChild = asChildRun(repairDispatch)
+            repairRun = repairChild
+            // The repair child must not use tools: it only reformats completed
+            // evidence, so the delegation-time `toolFilter: { allow: [] }` this
+            // path used before DSH 0.2 is now applied to its own scope.
+            liftRepairReadOnly = applyReadOnlyToolFilter(
+              this.requireChildAgent(parent, repairChild.childId, subagentProvider),
+              { allow: [] },
+            )
             const repairedOutcome = await Promise.race([
-              repairRun.result,
+              repairChild.result,
               new Promise<never>((_resolve, reject) => repairController.signal.addEventListener('abort', () => reject(new Error('structured output repair timed out')), { once: true })),
             ])
             const repaired = structuredEvaluation(repairedOutcome.structured, textOf(repairedOutcome), task.input.outputSchema)
             repairSucceeded = repairedOutcome.stopReason === 'completed' && repaired.errors.length === 0
             structured = repairSucceeded ? repaired.value : undefined
             repairErrors = repairedOutcome.stopReason === 'completed' ? repaired.errors : [`structured repair child stopped with ${repairedOutcome.stopReason}`]
-            measuredUsage = addUsage(measuredUsage, usageOf(repairRun.localAgent))
+            measuredUsage = addUsage(measuredUsage, usageOf(childAgentOf(parent, repairChild.childId)))
             usage = measuredUsage?.totalTokens ?? usage
           } catch (error) {
             structured = undefined
@@ -1211,6 +1324,7 @@ export class DynamicWorkflowEngine {
           } finally {
             clearTimeout(timer)
             run.controller.signal.removeEventListener('abort', forwardAbort)
+            liftRepairReadOnly?.()
             await repairRun?.dispose()
           }
         }
@@ -1246,7 +1360,7 @@ export class DynamicWorkflowEngine {
       let draft: WorkflowTaskResult = {
         taskId: task.id, name: task.input.name, status, finalText,
         ...(structured === undefined ? {} : { structured }),
-        childId: childRun.id, stopReason,
+        childId: childRun.childId, stopReason,
         startedAt: task.startedAt, endedAt,
         ...(measuredUsage === undefined ? {} : { tokenUsage: usage }),
         ...(measuredUsage === undefined ? {} : { usage: measuredUsage }),
@@ -1272,7 +1386,7 @@ export class DynamicWorkflowEngine {
       if (status === 'completed' && verification !== undefined) {
         const cwd = cwdOf(parent)
         for (let attempt = 0; attempt <= 2; attempt += 1) {
-          const observed = observedToolEvidence(childRun.localAgent)
+          const observed = observedToolEvidence(childAgent)
           const workspaceAfter = verification.requiresMutation === true || (verification.requiredChangedPaths?.length ?? 0) > 0
             ? await gitWorkspaceState(cwd, verification.requiredChangedPaths)
             : undefined
@@ -1308,16 +1422,13 @@ export class DynamicWorkflowEngine {
             mutationEvidence,
           }
           if (reasons.length === 0 || verification.enforcement === 'warn') break
-          if (attempt === 2 || childRun.localAgent === undefined) throw new Error(`agent verification failed: ${reasons.join('; ')}`)
-          childRun.localAgent.followup(createUserMessage({
-            content: [{ type: 'text', text: `Verification failed. Repair the same task, then provide a complete final result.\n${reasons.map(reason => `- ${reason}`).join('\n')}` }],
-            source: { kind: 'plugin', plugin: '@dsh-external/workflow', form: 'relay' },
-          }))
-          await childRun.localAgent.whenIdle()
-          draft = { ...draft, finalText: latestAssistantText(childRun.localAgent, draft.finalText) }
+          if (attempt === 2 || childAgent === undefined) throw new Error(`agent verification failed: ${reasons.join('; ')}`)
+          childAgent.followup(workflowRelayMessage(`Verification failed. Repair the same task, then provide a complete final result.\n${reasons.map(reason => `- ${reason}`).join('\n')}`, 'verification-repair'))
+          await childAgent.whenIdle()
+          draft = { ...draft, finalText: latestAssistantText(childAgent, draft.finalText) }
           terminalDraft = draft
         }
-        const repairedUsage = usageOf(childRun.localAgent)
+        const repairedUsage = usageOf(childAgent)
         if (repairedUsage !== undefined && repairedUsage.totalTokens !== usage) {
           run.spentTokens += repairedUsage.totalTokens - usage
           usage = repairedUsage.totalTokens
@@ -1340,7 +1451,7 @@ export class DynamicWorkflowEngine {
         ...(warnings === undefined || warnings.length === 0 ? {} : { verificationWarnings: warnings }),
       }
       if (task.result.status === 'completed' && (warnings === undefined || warnings.length === 0)) run.writer.setCached(cacheKey, task.result)
-      this.emit(run, 'agent-completed', { taskId: task.id, outcome: status, childId: childRun.id })
+      this.emit(run, 'agent-completed', { taskId: task.id, outcome: status, childId: childRun.childId })
       appendNative(run.nativeSession, 'tool-workflow/agent-end', { runId: WorkflowRunId(run.snapshot.runId), seq: task.sequence, outcome: status === 'completed' ? 'completed' : status === 'stopped' ? 'cancelled' : 'failed' })
       task.terminalPublished = true
       task.resolve(task.result)
@@ -1364,20 +1475,21 @@ export class DynamicWorkflowEngine {
       }
       if (task.nativeStarted && task.result !== undefined) {
         const previous = task.result
-        const measured = usageOf(task.run?.localAgent)
+        const measured = usageOf(childAgentOf(run.input.parent, task.childId))
         if (measured !== undefined && measured.totalTokens !== accountedUsage) {
           run.spentTokens += measured.totalTokens - accountedUsage
           accountedUsage = measured.totalTokens
         }
         task.result = {
           ...previous,
-          finalText: latestAssistantText(task.run?.localAgent, previous.finalText),
+          finalText: latestAssistantText(childAgentOf(run.input.parent, task.childId), previous.finalText),
           ...(measured === undefined ? {} : { tokenUsage: measured.totalTokens, usage: measured }),
         }
       }
       if (task.nativeStarted) task.resolve(task.result)
       else task.reject(error)
     } finally {
+      task.liftReadOnly?.()
       try { await task.run?.dispose() } finally {
         await isolation?.dispose()
         if (releaseRun !== undefined) {
@@ -1388,6 +1500,53 @@ export class DynamicWorkflowEngine {
         }
       }
     }
+  }
+
+  /**
+   * Start one child through the managed activation seam.
+   *
+   * `delivery: 'caller'` keeps the result with the workflow engine instead of
+   * notifying the parent model, which is what a workflow child needs.
+   * @param provider - registered subagent transport name.
+   * @param request - start request without the caller-owned signal.
+   * @param signal - cancellation owned by the run.
+   * @returns the provider-neutral child handle.
+   */
+  private async startChild(provider: string, request: Omit<SubagentStartRequest, 'signal'>, signal: AbortSignal): Promise<WorkflowChildRun> {
+    const { label = 'workflow-agent', ...task } = request
+    const activation = await this.deps.subagents.startActivation({
+      provider,
+      label,
+      request: task,
+      signal,
+      delivery: 'caller',
+    })
+    return { childId: String(activation.childId), result: activation.result, dispose: async () => { await activation.dispose() } }
+  }
+
+  /**
+   * Resolve the published child Agent or fail loud.
+   * @param parent - the delegating parent whose scope holds the registry.
+   * @param childId - durable child session id.
+   * @param provider - provider name for the error message.
+   * @returns the live child Agent.
+   */
+  private requireChildAgent(parent: Agent, childId: string, provider: string): Agent {
+    const child = childAgentOf(parent, childId)
+    if (child === undefined) throw new WorkflowControlError(`subagent provider "${provider}" did not publish a local child agent; a task that constrains its child's tools requires an in-process provider`)
+    return child
+  }
+
+  /**
+   * Constrain one published child to the workflow's read-only tool mask.
+   * @param parent - the delegating parent whose scope holds the registry.
+   * @param childId - durable child session id.
+   * @param provider - provider name for the error message.
+   * @returns the disposer that lifts the restriction.
+   */
+  private restrictChildToReadOnly(parent: Agent, childId: string, provider: string): () => void {
+    const child = this.requireChildAgent(parent, childId, provider)
+    return applyReadOnlyToolFilter(child, resolveReadOnlyToolFilter(parent, this.deps.config.readOnlyAllowedTools, this.deps.config.readOnlyToolFilter.deny))
   }
 
   private taskPrompt(input: WorkflowSpawnAgentInput, cwd?: string): string {
@@ -1413,7 +1572,7 @@ export class DynamicWorkflowEngine {
       ...run.input.module.manifest.phases,
       ...[...run.tasks.values()].flatMap(item => item.input.phase ?? item.phase ?? []),
     ])]
-    const liveText = latestAssistantText(task.run?.localAgent, task.result?.finalText ?? '')
+    const liveText = latestAssistantText(childAgentOf(run.input.parent, task.childId), task.result?.finalText ?? '')
     return {
       taskId, name: task.input.name, status: task.status,
       ...(task.input.phase === undefined ? {} : { phase: task.input.phase }),

@@ -246,13 +246,13 @@ export class DynamicWorkflowService extends Service {
     if (jobs === undefined) return undefined
     try {
       return jobs.start({
-        kind: 'workflow', label: run.getSnapshot().workflow, owner: agent,
+        kind: 'workflow', label: run.getSnapshot().workflow, owner: agent.session.id,
         run: () => ({
           cancel: reason => { this.stop(agent, run.runId, reason) },
           done: run.done.then(snapshot => ({
-            status: snapshot.status === 'completed' ? 'completed' : snapshot.status === 'stopped' ? 'killed' : 'failed',
+            status: snapshot.status === 'completed' ? 'completed' as const : snapshot.status === 'stopped' ? 'killed' as const : 'failed' as const,
             detail: snapshot.status,
-            output: terminalOutput(snapshot),
+            result: terminalOutput(snapshot),
           })),
         }),
       })

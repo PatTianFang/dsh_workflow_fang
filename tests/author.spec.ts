@@ -1,10 +1,32 @@
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SubagentRuntime, SubagentStartRequest } from '@deepseek-ai/dsh-subagent'
+import { SessionId } from '@deepseek-ai/dsh-session'
+import type { SubagentActivationSpec, SubagentCapabilities, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 import { describe, expect, it, vi } from 'vitest'
 import { authorWorkflowCapsule } from '../src/author.js'
 import type { ResolvedWorkflowConfig } from '../src/types.js'
 
-const parent = { session: { header: { cwd: 'C:\\workspace' } }, ctx: { tools: { schemas: () => [{ name: 'read' }, { name: 'write' }, { name: 'shell' }] } } } as unknown as Agent
+const toolSchemas = (): Array<{ name: string }> => [{ name: 'read' }, { name: 'write' }, { name: 'shell' }]
+
+/** Child-scope restriction spy shared by every published authoring child. */
+const restrict = vi.fn(() => vi.fn())
+
+/** Child Agents published by the most recent fake activation manager. */
+const children = new Map<string, Agent>()
+
+const parent = {
+  session: { header: { cwd: 'C:\\workspace' } },
+  ctx: {
+    tools: { schemas: toolSchemas },
+    agents: { get: (id: SessionId): Agent | undefined => children.get(String(id)) },
+  },
+} as unknown as Agent
+
+function childAgent(): Agent {
+  return {
+    session: { ownEvents: () => [] },
+    ctx: { tools: { schemas: toolSchemas, restrict } },
+  } as unknown as Agent
+}
 
 function config(): ResolvedWorkflowConfig {
   return {
@@ -28,12 +50,16 @@ function authored(source = `async function run(wf, args) { return await wf.runAg
   }
 }
 
-function service(payloads: unknown[], capabilities = { outputSchema: true, depthLimit: true, toolFilter: true, persona: true }) {
+function service(payloads: unknown[], capabilities: SubagentCapabilities = { outputSchema: true, depthLimit: true, agentOptions: true, agentPreset: true }, publishChild = true) {
   let index = 0
-  const start = vi.fn(async (_provider: string, _request: SubagentStartRequest) => {
+  children.clear()
+  restrict.mockClear()
+  const start = vi.fn(async (_spec: SubagentActivationSpec) => {
     const payload = payloads[index++]
+    const childId = `child-${index}`
+    if (publishChild) children.set(childId, childAgent())
     return {
-      id: `child-${index}`, localAgent: undefined,
+      childId: SessionId(childId), messageId: undefined,
       result: Promise.resolve(index === 1
         ? { output: [{ type: 'text' as const, text: 'workspace facts' }], stopReason: 'completed' as const }
         : { output: [{ type: 'text' as const, text: 'authored' }], structured: payload, stopReason: 'completed' as const }),
@@ -42,7 +68,8 @@ function service(payloads: unknown[], capabilities = { outputSchema: true, depth
   })
   return {
     start,
-    value: { getProvider: (name: string) => ['scout', 'author'].includes(name) ? { name, capabilities, inheritsParentContext: false } : undefined, start } as unknown as SubagentRuntime,
+    restrict,
+    value: { getProvider: (name: string) => ['scout', 'author'].includes(name) ? { name, capabilities, inheritsParentContext: false } : undefined, startActivation: start } as unknown as SubagentRuntime,
   }
 }
 
@@ -52,8 +79,11 @@ describe('scout-then-author workflow generation', () => {
     const result = await authorWorkflowCapsule({ request: 'build it', parent, subagents: fake.value, config: config(), signal: new AbortController().signal })
     expect(result.capsule).toMatchObject({ format: 'dsh.workflow', manifest: { name: 'authored' }, provenance: { dshVersion: '0.0.1-rc.2', pluginVersion: '0.1.0' } })
     expect(fake.start).toHaveBeenCalledTimes(2)
-    expect(fake.start.mock.calls[0]).toMatchObject(['scout', { toolFilter: { allow: ['read'] }, agentOptions: { provider: 'fast-llm', model: 'quick', maxTokens: 100 } }])
-    expect(fake.start.mock.calls[1]).toMatchObject(['author', { outputSchema: expect.any(Object), agentOptions: { provider: 'deep-llm', model: 'deep', maxTokens: 300 } }])
+    expect(fake.start.mock.calls[0]).toMatchObject([{ provider: 'scout', label: 'workflow-scout', delivery: 'caller', request: { agentOptions: { provider: 'fast-llm', model: 'quick', maxTokens: 100 } } }])
+    expect(fake.start.mock.calls[1]).toMatchObject([{ provider: 'author', label: 'workflow-author', delivery: 'caller', request: { outputSchema: expect.any(Object), agentOptions: { provider: 'deep-llm', model: 'deep', maxTokens: 300 } } }])
+    // DSH 0.2 has no delegation-time toolFilter: the same read-only mask is
+    // applied to each published child's own tool scope instead.
+    expect(fake.restrict.mock.calls).toEqual([[{ allow: ['read'] }], [{ allow: ['read'] }]])
   })
 
   it('feeds validation failures into a bounded repair loop', async () => {
@@ -61,12 +91,14 @@ describe('scout-then-author workflow generation', () => {
     const result = await authorWorkflowCapsule({ request: 'build it', parent, subagents: fake.value, config: config(), signal: new AbortController().signal })
     expect(result.capsule.manifest.name).toBe('authored')
     expect(fake.start).toHaveBeenCalledTimes(3)
-    expect(fake.start.mock.calls[2]?.[1].prompt[0]).toMatchObject({ text: expect.stringContaining('Repair this validation failure') })
+    expect(fake.start.mock.calls[2]?.[0].request.prompt[0]).toMatchObject({ text: expect.stringContaining('Repair this validation failure') })
   })
 
   it('fails loudly when authoring cannot enforce required provider capabilities', async () => {
-    const fake = service([], { outputSchema: true, depthLimit: true, toolFilter: false, persona: true })
-    await expect(authorWorkflowCapsule({ request: 'build it', parent, subagents: fake.value, config: config(), signal: new AbortController().signal })).rejects.toThrow(/cannot enforce read-only/u)
+    // DSH 0.2 enforces read-only scoping on the published child Agent, so the
+    // enforceability precondition is now "the provider publishes a local child".
+    const fake = service([], { outputSchema: true, depthLimit: true, agentOptions: true, agentPreset: true }, false)
+    await expect(authorWorkflowCapsule({ request: 'build it', parent, subagents: fake.value, config: config(), signal: new AbortController().signal })).rejects.toThrow(/did not publish a local child agent.*read-only scouting/u)
     await expect(authorWorkflowCapsule({ request: ' ', parent, subagents: fake.value, config: config(), signal: new AbortController().signal })).rejects.toThrow(/must be non-empty/u)
   })
 
@@ -75,7 +107,7 @@ describe('scout-then-author workflow generation', () => {
     await expect(authorWorkflowCapsule({ request: 'build it', parent, subagents: invalid.value, config: config(), signal: new AbortController().signal })).rejects.toThrow(/failed validation after 3 attempts/u)
     expect(invalid.start).toHaveBeenCalledTimes(4)
 
-    const incapable = service([undefined], { outputSchema: false, depthLimit: true, toolFilter: true, persona: true })
+    const incapable = service([undefined], { outputSchema: false, depthLimit: true, agentOptions: true, agentPreset: true })
     await expect(authorWorkflowCapsule({ request: 'build it', parent, subagents: incapable.value, config: config(), signal: new AbortController().signal })).rejects.toThrow(/cannot produce structured output/u)
   })
 
@@ -85,7 +117,7 @@ describe('scout-then-author workflow generation', () => {
     const revisedFake = service([undefined, authored()])
     const revised = await authorWorkflowCapsule({ request: 'build it', parent, subagents: revisedFake.value, config: config(), signal: new AbortController().signal, existing: first.capsule, change: 'more evidence', fromRunId: 'run-source' })
     expect(revised.capsule.provenance).toMatchObject({ fromRunId: 'run-source', fromWorkflowName: 'authored', revisionOf: 'authored' })
-    expect(revisedFake.start.mock.calls[1]?.[1].prompt[0]).toMatchObject({ text: expect.stringMatching(/Existing capsule:.*Requested change:\nmore evidence/su) })
+    expect(revisedFake.start.mock.calls[1]?.[0].request.prompt[0]).toMatchObject({ text: expect.stringMatching(/Existing capsule:.*Requested change:\nmore evidence/su) })
   })
 
   it('rejects an agent name passed where an opaque task id is required', async () => {
