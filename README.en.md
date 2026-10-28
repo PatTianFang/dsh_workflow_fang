@@ -24,11 +24,12 @@ The native DSH `workflow` tool remains the best fit for a single foreground fan-
 Requires Node.js `>=22.19` and the DSH package generation pinned in [`compatibility.json`](compatibility.json) (currently DSH `0.2.1-rc.3`).
 
 ```sh
-# install from a local checkout of this repository
-dsh plugin --profile desktop add /path/to/dsh_workflow
+# install from this repository (main branch)
+dsh plugin --profile desktop add "github:PatTianFang/dsh_workflow_fang#main"
 
-# or install from your GitHub fork once pushed
-dsh plugin --profile desktop add "github:<your-account>/dsh_workflow#main"
+# or from a local checkout / packed tarball
+dsh plugin --profile desktop add /path/to/dsh_workflow_fang
+dsh plugin --profile desktop add /path/to/dsh-external-workflow-0.2.0.tgz
 
 dsh --profile desktop --dump-config
 ```

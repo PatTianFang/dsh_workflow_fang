@@ -57,11 +57,12 @@ flowchart LR
 
 ```sh
 # 构建产物已随仓库提交，git 源安装不需要在用户侧编译
-# 从本地仓库目录安装
-dsh plugin --profile desktop add /path/to/dsh_workflow
+# 从本仓库安装（main 分支）
+dsh plugin --profile desktop add "github:PatTianFang/dsh_workflow_fang#main"
 
-# 或从你自己的 GitHub 仓库安装
-dsh plugin --profile desktop add "github:<你的账号>/dsh_workflow#main"
+# 或从本地目录 / 已打包 tarball 安装
+dsh plugin --profile desktop add /path/to/dsh_workflow_fang
+dsh plugin --profile desktop add /path/to/dsh-external-workflow-0.2.0.tgz
 
 # 验证 bundle 已进入 profile 合成树
 dsh --profile desktop --dump-config
